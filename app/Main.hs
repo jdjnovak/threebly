@@ -1,18 +1,24 @@
 module Main where
 
 import Text.Read
+import System.IO
+import System.Environment
 
 data Error = ParseError String
   | TypeError String
+  | RuntimeError String
+  deriving Show
 
-data Command = Def String
-  | Set String String
-  | Out String
-  | In Type
+type Ident = String
 
-data Type = Str String | Num Int | None
+data Types = Str String | Num Int | Nil deriving Show
 
-type Variable = (String, String, Type)
+data Ops = Def Ident
+  | Set Ident Int
+  | Call Ident [Types]
+  | Return
+  deriving (Show)
+
 
 -------------------------
 -- HELPERS FOR STRINGS --
@@ -41,8 +47,8 @@ getLastChar :: String -> Maybe Char
 getLastChar str = recToLast str
   where
     recToLast :: String -> Maybe Char
+    recToLast "" = Nothing
     recToLast (x:xs) = case length (x:xs) of
-      0 -> Nothing
       1 -> Just x
       _ -> recToLast xs
 
@@ -69,18 +75,141 @@ splitStringWhen cond s = case dropWhile cond s of
                      s' -> w : splitStringWhen cond s''
                                where (w, s'') = break cond s'
 
--- Only do ints & strings for now
-parseSet :: String -> String -> Either Error Variable
-parseSet name value = case isString value of
-  False -> case (readMaybe value :: Maybe Int) of
-    Just v -> Right ("int", name, Num v)
-    Nothing -> Left $ TypeError "TypeError: Only support Integers and Strings denoted by double quotes."
-  True -> Right ("str", name, Str value)
+cleanParams :: [String] -> [Types]
+cleanParams [] = []
+cleanParams (p:ps) = case (readMaybe p :: Maybe Int) of
+  Just num -> (Num num) : cleanParams ps
+  Nothing -> (Str (tail (init p))) : cleanParams ps
+
+parseLine :: String -> Either Error Ops
+parseLine str = parseHelper (splitStringWhen (==' ') str)
+  where
+    parseHelper :: [String] -> Either Error Ops
+    parseHelper [] = Left $ ParseError "Error in parsing empty string"
+    parseHelper (o:os) = case (head o == '{' && last o == '}') of
+      True -> Right $ Def (tail (init o))
+      False -> case (head o == '(' && last o == ')') of
+        True -> case (readMaybe (last os) :: Maybe Int) of
+          Just n -> Right $ Set (tail (init o)) n
+          Nothing -> Left $ TypeError "Must be an integer"
+        False -> case (head o == '[' && last o == ']') of
+          True -> Right $ Call (tail (init o)) (cleanParams os)
+          False -> Left $ ParseError $ "Unknown token: " ++ o
+
+parseLines :: [String] -> Either Error [Ops]
+parseLines [] = Right []
+parseLines (o:os) = case parseLine o of
+  Right o' -> case parseLines os of
+    Right os' -> Right $ o':os'
+    Left e -> Left e
+  Left e' -> Left e'
+
+-------------------------
+-- EVALUATOR FUNCTIONS --
+-------------------------
+evaluateProgram :: [Ops] -> (IO ())
+evaluateProgram ops = case runWithStack [] ops of
+  Right types -> printResultTypeList types
+  Left err -> print err
+  where
+    runWithStack :: [(String, Types)] -> [Ops] -> Either Error [Types]
+    runWithStack _ [] = Right [Nil]
+    runWithStack st (o:os) = case o of
+      Def name -> runWithStack ((name, Nil):st) os
+      Set name value -> case stackHasVar st name of
+        False -> Left $ RuntimeError "Cannot set undefined variables"
+        True -> runWithStack (replaceStackVariable st (name, Num value)) os
+      Call name (p:ps:[]) -> case name of
+        "add" -> case p of
+          Str nm -> case (getStackVarValue st nm) of
+            Nil -> Left $ ParseError $ "Unknown variable name " ++ nm
+            Num i -> case runWithStack st os of
+              Right ts -> Right $ (Num (i + (getIntFromNum ps))) : ts
+              Left e -> Left e
+          Num nm -> case ps of
+            Num nm' -> case runWithStack st os of
+              Right ts -> Right $ (Num (nm + nm')):ts
+              Left e -> Left e
+            Str str -> case (getStackVarValue st str) of
+              Nil -> Left $ ParseError $ "Unknown variable name " ++ str
+              Num i -> case runWithStack st os of
+                Right ts -> Right $ (Num (nm + i)):ts
+                Left e -> Left e
+              _ -> Left $ TypeError "Must add only ints"
+            _ -> Left $ TypeError "Must add only ints"
+          _ -> Left $ TypeError "Must add only ints"
+        "sub" -> case p of
+          Str nm -> case (getStackVarValue st nm) of
+            Nil -> Left $ ParseError $ "Unknown variable name " ++ nm
+            Num i -> case runWithStack st os of
+              Right ts -> Right $ (Num (i - (getIntFromNum ps))) : ts
+              Left e -> Left e
+          Num nm -> case ps of
+            Num nm' -> case runWithStack st os of
+              Right ts -> Right $ (Num (nm - nm')):ts
+              Left e -> Left e
+            Str str -> case (getStackVarValue st str) of
+              Nil -> Left $ ParseError $ "Unknown variable name " ++ str
+              Num i -> case runWithStack st os of
+                Right ts -> Right $ (Num (nm - i)):ts
+                Left e -> Left e
+              _ -> Left $ TypeError "Must add only ints"
+            _ -> Left $ TypeError "Must add only ints"
+          _ -> Left $ TypeError "Must add only ints"
+        _ -> Left $ ParseError "I only know add"
+      _ -> Left $ ParseError "I can't do the rest of my ops"
+
+    stackHasVar :: [(String, Types)] -> String -> Bool
+    stackHasVar [] _ = False
+    stackHasVar ((v,_):vs) var = v == var || stackHasVar vs var
+
+printResultType :: [Types] -> String
+printResultType [] = ""
+printResultType (t:ts) = printtype ++ ('\n' : printtypes)
+  where
+    printtype = case t of
+      Num n -> (show n)
+      Str s -> s
+      Nil -> ""
+    printtypes = printResultType ts
+
+printResultTypeList :: [Types] -> (IO ())
+printResultTypeList ts = putStr $ printResultType ts
+
+replaceStackVariable :: [(String, Types)] -> (String, Types) -> [(String, Types)]
+replaceStackVariable [] _ = []
+replaceStackVariable ((sname, st):ss) (name, t) = if sname == name then (name, t):ss else (sname,st):(replaceStackVariable ss (name, t))
+
+getStackVarValue :: [(String, Types)] -> String -> Types
+getStackVarValue [] _ = Nil
+getStackVarValue ((sn, st):ss) name = if sn == name then st else getStackVarValue ss name
+
+getIntFromNum :: Types -> Int
+getIntFromNum (Num num) = num
 
 
+-----------------
+-- TEST INPUTS --
+-----------------
+testinput :: String
+testinput = "{myvar}\n(myvar) 5\n[add] [myvar] 2"
 
+testinput2 :: String
+testinput2 = "{a}\n{b}\n{c}\n(a) 12\n(b) 3\n(c) 7\n[add] [c] -2\n[sub] [a] 3"
+
+----------
+-- MAIN --
+----------
 main :: IO ()
 main =
-  do 
-    let lines = splitStringWhen (=='\n') "set myvar 10\nset myvar2 12"
-    print lines
+  do
+    args <- getArgs
+    case length args of
+      1 -> do
+        file <- readFile (head args)
+        let lns = splitStringWhen (=='\n') file
+        let parsed = parseLines lns
+        case parsed of
+          Right ops -> evaluateProgram ops
+          Left err -> print err
+      _ -> print $ "Bad"
